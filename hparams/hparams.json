@@ -1,0 +1,33 @@
+{
+    "netuid": 3,
+
+    "num_evals_per_submission": 3,
+    "eval_steps": 100,
+    "eval_timeout": 600,
+
+    "benchmark_model_size": "150M",
+    "benchmark_sequence_length": 1024,
+    "benchmark_batch_size": 8,
+
+    "set_weights_interval_seconds": 600,
+
+    "sandbox": {
+        "memory_limit": "16g",
+        "cpu_count": 4,
+        "gpu_count": 1,
+        "pids_limit": 256
+    },
+
+    "verification": {
+        "logits_atol": 1e-3,
+        "logits_rtol": 1e-3,
+        "loss_tolerance": 1e-3,
+        "verify_model_state": false,
+        "deterministic_mode": true,
+        "random_seed": 42
+    },
+
+    "storage": {
+        "database_url": "sqlite+aiosqlite:///tournament.db"
+    }
+}
