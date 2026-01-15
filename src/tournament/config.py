@@ -41,6 +41,10 @@ class HParams(BaseModel):
     """Hyperparameters loaded from hparams.json."""
 
     netuid: int = 3
+    
+    # Emissions distribution
+    burn_rate: float = 0.95  # 95% to validator, 5% to winner
+    burn_uid: int = 1  # UID that receives burn portion (validator)
 
     # Evaluation settings
     num_evals_per_submission: int = 1  # Number of validators that must evaluate
@@ -101,6 +105,10 @@ class Config(BaseSettings):
     wallet_name: str = "default"
     wallet_hotkey: str = "default"
     subtensor_network: str = "finney"
+    
+    # Validator address that receives payments (set to validator's ss58 address)
+    # Miners pay this address to submit code (anti-spam)
+    validator_hotkey: str = ""  # MUST be set in .env for production
 
     # R2/S3 storage (for code submissions)
     r2_account_id: str = ""

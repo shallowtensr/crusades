@@ -4,6 +4,8 @@ import argparse
 import sys
 import time
 
+import sys
+
 from rich.align import Align
 from rich.console import Console
 from rich.layout import Layout
@@ -20,7 +22,7 @@ from tournament.tui.client import (
     format_time_ago,
 )
 
-console = Console()
+console = Console(force_terminal=True)
 
 
 def create_chart(history: list[dict], width: int = 50, height: int = 8) -> Text:
@@ -329,8 +331,8 @@ def create_dashboard_layout(
     )
 
     footer_text = (
-        "[cyan]↑↓[/] Navigate  "
-        "[cyan]←→[/] Switch panel  "
+        "[cyan]j/k[/] Navigate  "
+        "[cyan]h/l[/] Switch panel  "
         "[cyan]Enter[/] View details  "
         "[cyan]r[/] Refresh  "
         "[cyan]q[/] Quit"
@@ -371,10 +373,13 @@ def create_submission_header(detail: SubmissionDetail) -> Panel:
     if len(code_hash) > 16:
         code_hash = code_hash[:16] + "..."
 
+    score = sub.get('final_score')
+    score_display = f"{score:.2f}" if score is not None else "N/A"
+    
     grid.add_row(
         f"[bold]UID:[/] {sub.get('miner_uid', 'N/A')}",
         f"[bold]Status:[/] [{status_color}]{status}[/{status_color}]",
-        f"[bold]TPS:[/] [green]{sub.get('final_score', 0):.2f}[/green]",
+        f"[bold]TPS:[/] [green]{score_display}[/green]",
         f"[bold]Submitted:[/] {format_time_ago(sub.get('created_at'))}",
     )
     grid.add_row(
@@ -430,31 +435,44 @@ def create_evaluations_table(detail: SubmissionDetail) -> Panel:
     return Panel(table, title=title, border_style="cyan")
 
 
-def create_code_panel(detail: SubmissionDetail, scroll_offset: int = 0) -> Panel:
-    """Create the syntax-highlighted code panel."""
+def create_code_panel(detail: SubmissionDetail, scroll_offset: int = 0, visible_lines: int = 20) -> Panel:
+    """Create the syntax-highlighted code panel with scroll support."""
     code = detail.code
 
     if not code:
         content = Text("Code not available", style="dim italic", justify="center")
+        total_lines = 0
     else:
+        lines = code.split('\n')
+        total_lines = len(lines)
+        
+        # Slice code based on scroll offset
+        start_line = scroll_offset
+        end_line = min(scroll_offset + visible_lines, total_lines)
+        visible_code = '\n'.join(lines[start_line:end_line])
+        
         content = Syntax(
-            code,
+            visible_code,
             "python",
             theme="monokai",
             line_numbers=True,
             word_wrap=False,
-            start_line=1,
+            start_line=start_line + 1,  # Line numbers start from scroll position
         )
 
     code_hash = detail.submission.get("code_hash", "")[:16]
     title = "[bold]Code[/bold]"
     if code_hash:
         title += f" [dim](hash: {code_hash}...)[/dim]"
+    
+    # Show scroll position
+    if code and total_lines > visible_lines:
+        title += f" [cyan](lines {scroll_offset + 1}-{min(scroll_offset + visible_lines, total_lines)}/{total_lines}, j/k to scroll)[/cyan]"
 
     return Panel(content, title=title, border_style="green")
 
 
-def create_submission_layout(detail: SubmissionDetail, show_code: bool = True) -> Layout:
+def create_submission_layout(detail: SubmissionDetail, show_code: bool = True, code_scroll: int = 0) -> Layout:
     """Create the submission detail layout."""
     layout = Layout()
 
@@ -485,9 +503,9 @@ def create_submission_layout(detail: SubmissionDetail, show_code: bool = True) -
     layout["evaluations"].update(create_evaluations_table(detail))
 
     if show_code:
-        layout["code"].update(create_code_panel(detail))
+        layout["code"].update(create_code_panel(detail, scroll_offset=code_scroll))
 
-    footer_text = "[cyan]c[/] Toggle code  [cyan]r[/] Refresh  [cyan]b/Esc[/] Back  [cyan]q[/] Quit"
+    footer_text = "[cyan]j/k[/] Scroll code  [cyan]c[/] Toggle code  [cyan]r[/] Refresh  [cyan]b/Esc[/] Back  [cyan]q[/] Quit"
     layout["footer"].update(
         Panel(Text.from_markup(footer_text, justify="center"), border_style="dim")
     )
@@ -533,6 +551,10 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False):
     client_class = MockClient if demo else TournamentClient
     client_args = () if demo else (base_url,)
 
+    # Hide cursor and set up alternate screen buffer
+    print("\033[?25l", end="", flush=True)  # Hide cursor
+    print("\033[?1049h", end="", flush=True)  # Use alternate screen buffer
+
     try:
         with client_class(*client_args) as client:
             # State
@@ -540,33 +562,41 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False):
             current_view = "dashboard"
             current_detail: SubmissionDetail | None = None
             show_code = True
+            code_scroll = 0  # Scroll offset for code view
             last_refresh = time.time()
 
             # Dashboard navigation state
             active_panel = "leaderboard"  # or "recent"
             leaderboard_idx = 0 if data.leaderboard else None
             recent_idx = 0 if data.recent else None
+            needs_redraw = True  # Only redraw when something changes
 
             while True:
-                console.clear()
+                # Only redraw when needed (reduces blinking)
+                if needs_redraw:
+                    print("\033[2J\033[H", end="", flush=True)
 
-                if current_view == "dashboard":
-                    layout = create_dashboard_layout(
-                        data,
-                        leaderboard_idx=leaderboard_idx if active_panel == "leaderboard" else None,
-                        recent_idx=recent_idx if active_panel == "recent" else None,
-                        active_panel=active_panel,
-                        demo=demo,
-                    )
-                    console.print(layout)
-                elif current_view == "submission" and current_detail:
-                    layout = create_submission_layout(current_detail, show_code=show_code)
-                    console.print(layout)
+                    if current_view == "dashboard":
+                        layout = create_dashboard_layout(
+                            data,
+                            leaderboard_idx=leaderboard_idx if active_panel == "leaderboard" else None,
+                            recent_idx=recent_idx if active_panel == "recent" else None,
+                            active_panel=active_panel,
+                            demo=demo,
+                        )
+                        console.print(layout)
+                    elif current_view == "submission" and current_detail:
+                        layout = create_submission_layout(current_detail, show_code=show_code, code_scroll=code_scroll)
+                        console.print(layout)
+                    
+                    needs_redraw = False
 
                 # Handle input
                 key = get_key_nonblocking(0.3)
 
                 if key:
+                    needs_redraw = True  # Any keypress triggers redraw
+                    
                     # Quit
                     if key == "q" or key == "\x03":
                         break
@@ -581,22 +611,22 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False):
                                 recent_idx = 0
                             last_refresh = time.time()
 
-                        # Switch panels with left/right arrows or Tab
-                        elif key in ("\x1b[D", "\x1b[C", "\t"):  # Left, Right, Tab
+                        # Switch panels with left/right arrows, h/l, or Tab
+                        elif key in ("\x1b[D", "\x1b[C", "\t", "h", "l"):  # Left, Right, Tab, h, l
                             if active_panel == "leaderboard":
                                 active_panel = "recent"
                             else:
                                 active_panel = "leaderboard"
 
-                        # Navigate up
-                        elif key == "\x1b[A":  # Up arrow
+                        # Navigate up (arrow or k)
+                        elif key in ("\x1b[A", "k"):  # Up arrow or k
                             if active_panel == "leaderboard" and leaderboard_idx is not None:
                                 leaderboard_idx = max(0, leaderboard_idx - 1)
                             elif active_panel == "recent" and recent_idx is not None:
                                 recent_idx = max(0, recent_idx - 1)
 
-                        # Navigate down
-                        elif key == "\x1b[B":  # Down arrow
+                        # Navigate down (arrow or j)
+                        elif key in ("\x1b[B", "j"):  # Down arrow or j
                             if active_panel == "leaderboard" and leaderboard_idx is not None:
                                 max_idx = min(9, len(data.leaderboard) - 1)
                                 leaderboard_idx = min(max_idx, leaderboard_idx + 1)
@@ -620,6 +650,7 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False):
                                 current_detail = client.fetch_submission_detail(submission_id)
                                 current_view = "submission"
                                 show_code = True
+                                code_scroll = 0
 
                         # Quick select with number keys
                         elif key.isdigit() and key != "0":
@@ -634,6 +665,7 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False):
                                         )
                                         current_view = "submission"
                                         show_code = True
+                                        code_scroll = 0
                             else:
                                 if idx < len(data.recent):
                                     recent_idx = idx
@@ -644,16 +676,29 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False):
                                         )
                                         current_view = "submission"
                                         show_code = True
+                                        code_scroll = 0
 
                     elif current_view == "submission":
                         # Back to dashboard
                         if key in ("b", "\x1b", "\x1b["):  # b, Esc
                             current_view = "dashboard"
                             current_detail = None
+                            code_scroll = 0  # Reset scroll when leaving
 
                         # Toggle code
                         elif key == "c":
                             show_code = not show_code
+
+                        # Scroll code down (j or down arrow)
+                        elif key in ("j", "\x1b[B") and show_code and current_detail:
+                            if current_detail.code:
+                                total_lines = len(current_detail.code.split('\n'))
+                                if code_scroll < total_lines - 10:
+                                    code_scroll += 3
+
+                        # Scroll code up (k or up arrow)
+                        elif key in ("k", "\x1b[A") and show_code and current_detail:
+                            code_scroll = max(0, code_scroll - 3)
 
                         # Refresh submission
                         elif key == "r" and current_detail:
@@ -665,13 +710,15 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False):
                 if current_view == "dashboard" and time.time() - last_refresh > refresh_interval:
                     data = client.fetch_all()
                     last_refresh = time.time()
+                    needs_redraw = True
 
     except KeyboardInterrupt:
         pass
     finally:
         # Restore terminal
+        print("\033[?1049l", end="", flush=True)  # Exit alternate screen buffer
+        print("\033[?25h", end="", flush=True)  # Show cursor
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        console.clear()
 
 
 def main():
@@ -683,17 +730,17 @@ def main():
         epilog="""
 Controls:
   Dashboard:
-    ↑/↓         Navigate entries
-    ←/→/Tab     Switch between Leaderboard and Recent
-    Enter/1-9   View submission details
-    r           Refresh data
-    q           Quit
+    j/k (or ↑/↓)   Navigate entries
+    h/l (or ←/→)   Switch between Leaderboard and Recent
+    Enter/1-9      View submission details
+    r              Refresh data
+    q              Quit
 
   Submission Detail:
-    c           Toggle code view
-    r           Refresh
-    b/Esc       Back to dashboard
-    q           Quit
+    c              Toggle code view
+    r              Refresh
+    b/Esc          Back to dashboard
+    q              Quit
 
 Examples:
   tplr --demo           # Run with mock data for demo

@@ -48,14 +48,10 @@ class Validator(BaseNode):
     def __init__(
         self,
         wallet: bt.wallet | None = None,
-        burn_hotkey: str | None = None,
-        burn_enabled: bool = False,
         skip_blockchain_check: bool = False,
     ):
         super().__init__(wallet=wallet)
 
-        self.burn_hotkey = burn_hotkey
-        self.burn_enabled = burn_enabled
         self.skip_blockchain_check = skip_blockchain_check
 
         # Components (initialized in start)
@@ -117,12 +113,10 @@ class Validator(BaseNode):
         # Code validator
         self.code_validator = CodeValidator()
 
-        # Weight setter
+        # Weight setter (uses burn_rate from hparams)
         self.weight_setter = WeightSetter(
             chain=self.chain,
             database=self.db,
-            burn_hotkey=self.burn_hotkey,
-            burn_enabled=self.burn_enabled,
         )
 
         # Payment verifier (anti-spam)
@@ -214,7 +208,13 @@ class Validator(BaseNode):
             self.last_sync_time = now
 
     async def process_pending_submissions(self) -> None:
-        """Validate pending submissions (including payment verification)."""
+        """Validate pending submissions.
+        
+        NOTE: Payment verification now happens at submission time (in API).
+        The payment_verified flag is set to True when submission is accepted.
+        This step only runs if payment wasn't verified at submission time
+        (legacy/fallback behavior).
+        """
         pending = await self.db.get_pending_submissions()
 
         for submission in pending:
@@ -226,9 +226,10 @@ class Validator(BaseNode):
                 SubmissionStatus.VALIDATING,
             )
 
-            # Step 1: Verify payment (if payment info provided)
+            # Step 1: Verify payment (FALLBACK - normally done at submission time)
+            # Payment is now verified upfront in API, so payment_verified should be True
             if submission.payment_block_hash and not submission.payment_verified:
-                logger.info(f"Verifying payment for submission {submission.submission_id}")
+                logger.warning(f"Payment not pre-verified for {submission.submission_id} - doing fallback verification")
 
                 payment_valid, payment_error = await self.payment_verifier.verify_payment(
                     block_hash=submission.payment_block_hash,
@@ -455,17 +456,6 @@ def main():
         help="Wallet hotkey",
     )
     parser.add_argument(
-        "--burn-hotkey",
-        type=str,
-        default=None,
-        help="Hotkey to burn emissions to when no winner",
-    )
-    parser.add_argument(
-        "--burn-enabled",
-        action="store_true",
-        help="Enable burn mode (all emissions to burn hotkey)",
-    )
-    parser.add_argument(
         "--skip-blockchain-check",
         action="store_true",
         help="Skip blockchain registration check (for local testing)",
@@ -477,10 +467,9 @@ def main():
     wallet = bt.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
 
     # Create and run validator
+    # Note: burn_rate and burn_uid are now configured in hparams.json
     validator = Validator(
         wallet=wallet,
-        burn_hotkey=args.burn_hotkey,
-        burn_enabled=args.burn_enabled,
         skip_blockchain_check=args.skip_blockchain_check,
     )
 

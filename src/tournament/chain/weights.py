@@ -1,8 +1,8 @@
-"""Weight setting logic - winner-takes-all model with burn fallback."""
+"""Weight setting logic with configurable burn rate."""
 
 import logging
 
-from ..config import get_config
+from ..config import get_config, get_hparams
 from ..storage.database import Database
 from .manager import ChainManager
 
@@ -12,35 +12,35 @@ logger = logging.getLogger(__name__)
 class WeightSetter:
     """Handles setting weights on the Bittensor network.
 
-    Implements winner-takes-all: 100% of emissions go to the
-    single top-scoring submission.
+    Implements burn_rate distribution:
+    - burn_rate portion (e.g., 95%) goes to burn_uid (validator)
+    - (1 - burn_rate) portion (e.g., 5%) goes to top TPS winner
 
-    If no valid winner exists or burn mode is enabled,
-    emissions go to the burn/owner hotkey.
+    If no valid winner exists, all emissions go to burn_uid.
     """
 
     def __init__(
         self,
         chain: ChainManager,
         database: Database,
-        burn_hotkey: str | None = None,
-        burn_enabled: bool = False,
     ):
         self.chain = chain
         self.db = database
         self.config = get_config()
-
-        # Burn hotkey - fallback destination for emissions
-        self.burn_hotkey = burn_hotkey
-        self.burn_enabled = burn_enabled
+        self.hparams = get_hparams()
+        
+        # Burn configuration from hparams
+        self.burn_rate = self.hparams.burn_rate  # e.g., 0.95 = 95% to validator
+        self.burn_uid = self.hparams.burn_uid    # UID that receives burn portion
 
     async def set_weights(self) -> tuple[bool, str]:
-        """Set weights based on current leaderboard.
+        """Set weights based on current leaderboard with burn_rate distribution.
 
-        Priority:
-        1. If burn_enabled, all emissions go to burn_hotkey
-        2. Otherwise, winner-takes-all to top submission
-        3. If no valid winner, fallback to burn_hotkey
+        Distribution:
+        - burn_rate (e.g., 95%) goes to burn_uid (validator)
+        - (1 - burn_rate) (e.g., 5%) goes to top TPS winner
+        
+        If no valid winner, 100% goes to burn_uid.
 
         Returns:
             Tuple of (success, message)
@@ -49,85 +49,82 @@ class WeightSetter:
         await self.chain.sync_metagraph()
         
         # Skip weight setting if metagraph sync failed
-        # This can happen if: subtensor not running, network issues, or netuid doesn't exist
         if self.chain.metagraph is None:
             logger.warning("Metagraph not available - cannot set weights")
             logger.warning("Possible causes: subtensor not running, network issues, or netuid doesn't exist")
             return False, "Metagraph sync failed - cannot set weights"
 
-        # Check if burn mode is enabled
-        if self.burn_enabled:
-            return await self._set_burn_weights("Burn mode enabled")
-
         # Get top submission
         top_submission = await self.db.get_top_submission()
 
+        # If no valid winner, all emissions go to burn_uid
         if top_submission is None:
-            logger.info("No finished submissions - falling back to burn")
-            return await self._set_burn_weights("No finished submissions")
+            logger.info("No finished submissions - 100% to burn_uid")
+            return await self._set_burn_only_weights("No finished submissions")
 
         # Verify miner is still registered
         winner_hotkey = top_submission.miner_hotkey
         if not self.chain.is_registered(winner_hotkey):
-            logger.warning(f"Winner {winner_hotkey} not registered - falling back to burn")
-            return await self._set_burn_weights(f"Winner {winner_hotkey} not registered")
+            logger.warning(f"Winner {winner_hotkey} not registered - 100% to burn_uid")
+            return await self._set_burn_only_weights(f"Winner {winner_hotkey} not registered")
 
         # Get UID for winner
         winner_uid = self.chain.get_uid_for_hotkey(winner_hotkey)
         if winner_uid is None:
-            logger.error(f"Could not get UID for {winner_hotkey} - falling back to burn")
-            return await self._set_burn_weights(f"Could not get UID for {winner_hotkey}")
+            logger.error(f"Could not get UID for {winner_hotkey} - 100% to burn_uid")
+            return await self._set_burn_only_weights(f"Could not get UID for {winner_hotkey}")
 
-        # Set 100% weight to winner
+        # Calculate weight distribution
+        winner_weight = 1.0 - self.burn_rate  # e.g., 5%
+        burn_weight = self.burn_rate           # e.g., 95%
+        
         logger.info(
-            f"Setting weights: UID {winner_uid} ({winner_hotkey}) "
-            f"score={top_submission.final_score:.2f} -> weight=1.0"
+            f"Setting weights with burn_rate={self.burn_rate:.0%}:\n"
+            f"  - UID {self.burn_uid} (validator): {burn_weight:.2f}\n"
+            f"  - UID {winner_uid} (winner, score={top_submission.final_score:.2f}): {winner_weight:.2f}"
         )
 
+        # Set weights for both burn_uid and winner
+        uids = [self.burn_uid, winner_uid]
+        weights = [burn_weight, winner_weight]
+        
+        # Handle case where winner IS the burn_uid (unlikely but possible)
+        if winner_uid == self.burn_uid:
+            uids = [self.burn_uid]
+            weights = [1.0]
+            logger.info(f"Winner is burn_uid - setting 100% to UID {self.burn_uid}")
+
         success, message = await self.chain.set_weights(
-            uids=[winner_uid],
-            weights=[1.0],
+            uids=uids,
+            weights=weights,
         )
 
         if success:
-            logger.info(f"Weights set successfully for UID {winner_uid}")
+            logger.info(f"Weights set successfully: {dict(zip(uids, weights))}")
         else:
             logger.error(f"Failed to set weights: {message}")
 
         return (success, message)
 
-    async def _set_burn_weights(self, reason: str) -> tuple[bool, str]:
-        """Set weights to burn hotkey.
+    async def _set_burn_only_weights(self, reason: str) -> tuple[bool, str]:
+        """Set 100% weights to burn_uid when no valid winner exists.
 
         Args:
-            reason: Why we're burning (for logging)
+            reason: Why we're giving all to burn_uid (for logging)
 
         Returns:
             Tuple of (success, message)
         """
-        if self.burn_hotkey is None:
-            logger.warning(f"No burn hotkey configured - cannot burn ({reason})")
-            return (False, f"No burn hotkey configured: {reason}")
-
-        if not self.chain.is_registered(self.burn_hotkey):
-            logger.warning(f"Burn hotkey {self.burn_hotkey} not registered")
-            return (False, f"Burn hotkey not registered: {reason}")
-
-        burn_uid = self.chain.get_uid_for_hotkey(self.burn_hotkey)
-        if burn_uid is None:
-            logger.error(f"Could not get UID for burn hotkey {self.burn_hotkey}")
-            return (False, f"Could not get burn UID: {reason}")
-
-        logger.info(f"Setting burn weights: UID {burn_uid} -> weight=1.0 ({reason})")
+        logger.info(f"Setting 100% weight to burn_uid {self.burn_uid} ({reason})")
 
         success, message = await self.chain.set_weights(
-            uids=[burn_uid],
+            uids=[self.burn_uid],
             weights=[1.0],
         )
 
         if success:
-            logger.info(f"Burn weights set successfully for UID {burn_uid}")
+            logger.info(f"Weights set successfully: UID {self.burn_uid} -> 100%")
         else:
-            logger.error(f"Failed to set burn weights: {message}")
+            logger.error(f"Failed to set weights: {message}")
 
-        return (success, f"Burn: {message}" if success else message)
+        return (success, f"Burn only ({reason}): {message}" if success else message)

@@ -159,8 +159,8 @@ async def get_queue_stats(
         all_submissions = await db.get_all_submissions()
         
         # Count by status
-        pending = [s for s in all_submissions if s.status == SubmissionStatus.PENDING]
-        running = [s for s in all_submissions if s.status == SubmissionStatus.RUNNING]
+        pending = [s for s in all_submissions if s.status in (SubmissionStatus.PENDING, SubmissionStatus.VALIDATING)]
+        running = [s for s in all_submissions if s.status == SubmissionStatus.EVALUATING]
         finished = [s for s in all_submissions if s.status == SubmissionStatus.FINISHED]
         
         # Calculate average wait time for finished submissions

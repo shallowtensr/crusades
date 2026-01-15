@@ -1,5 +1,7 @@
 {
     "netuid": 3,
+    "burn_rate": 0.95,
+    "burn_uid": 1,
 
     "num_evals_per_submission": 1,
     "evaluation_runs": 5,
