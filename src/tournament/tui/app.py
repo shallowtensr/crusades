@@ -237,7 +237,7 @@ def create_recent_table(
 
     table.add_column("#", justify="right", width=3)
     table.add_column("UID", justify="right", width=6)
-    table.add_column("Status", justify="left", width=12)
+    table.add_column("Status", justify="left", width=16)
     table.add_column("TPS", justify="right", width=10)
     table.add_column("Submitted", justify="right", width=10)
 
@@ -247,6 +247,8 @@ def create_recent_table(
         "evaluating": "cyan",
         "finished": "green",
         "failed_validation": "red",
+        "failed_evaluation": "red",
+        "failed_copy": "magenta",
         "error": "red",
     }
 
@@ -355,6 +357,8 @@ def create_submission_header(detail: SubmissionDetail) -> Panel:
         "evaluating": "cyan",
         "finished": "green",
         "failed_validation": "red",
+        "failed_evaluation": "red",
+        "failed_copy": "magenta",
         "error": "red",
     }
     status_color = status_colors.get(status, "white")
