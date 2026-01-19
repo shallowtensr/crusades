@@ -81,6 +81,32 @@ class SubmissionModel(Base):
     )
 
 
+class PaymentModel(Base):
+    """Database model for tracking used payments (prevents double-spending)."""
+
+    __tablename__ = "payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    payment_block_hash: Mapped[str] = mapped_column(String(66), nullable=False)
+    payment_extrinsic_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    
+    # Link to submission that used this payment
+    submission_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    
+    # Payment details
+    miner_hotkey: Mapped[str] = mapped_column(String(48), nullable=False)
+    miner_coldkey: Mapped[str] = mapped_column(String(48), nullable=False)
+    amount_rao: Mapped[int] = mapped_column(Integer, nullable=False)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        # Unique constraint on block_hash + extrinsic_index (prevents reuse)
+        Index("idx_payments_unique", "payment_block_hash", "payment_extrinsic_index", unique=True),
+        Index("idx_payments_miner", "miner_hotkey"),
+    )
+
+
 class EvaluationModel(Base):
     """Database model for evaluation results."""
 

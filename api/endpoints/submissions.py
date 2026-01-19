@@ -17,6 +17,7 @@ import hashlib
 import logging
 import tempfile
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from tournament.storage.r2 import get_r2_storage
 
 logger = logging.getLogger(__name__)
 hparams = get_hparams()
+config = get_config()
 
 router = APIRouter(prefix="/api/submissions", tags=["submissions"])
 
@@ -65,6 +67,97 @@ def verify_signature(timestamp: int, signature: str, hotkey: str) -> bool:
     except Exception as e:
         logger.error(f"Signature verification error: {e}")
         return False
+
+
+async def verify_payment_on_chain(
+    block_hash: str,
+    extrinsic_index: int,
+    miner_hotkey: str,
+    expected_amount_rao: int,
+    recipient_address: str,
+) -> tuple[bool, str, str]:
+    """Verify a payment transaction on chain (like Ridges).
+    
+    Args:
+        block_hash: Block hash containing the payment
+        extrinsic_index: Index of the extrinsic in the block
+        miner_hotkey: Miner's hotkey (to get coldkey owner)
+        expected_amount_rao: Expected payment amount in RAO
+        recipient_address: Expected payment destination (validator address)
+        
+    Returns:
+        Tuple of (is_valid, error_message, miner_coldkey)
+    """
+    try:
+        subtensor = bt.subtensor(network=config.subtensor_network)
+        
+        # Get the block
+        try:
+            payment_block = subtensor.substrate.get_block(block_hash=block_hash)
+        except Exception as e:
+            logger.error(f"Error retrieving payment block: {e}")
+            return False, "Payment block not found or invalid", ""
+        
+        if payment_block is None:
+            return False, f"Block not found: {block_hash}", ""
+        
+        # Get block number for coldkey lookup
+        block_number = payment_block['header']['number']
+        
+        # Get miner's coldkey (owner of hotkey)
+        coldkey = subtensor.get_hotkey_owner(hotkey_ss58=miner_hotkey, block=int(block_number))
+        if not coldkey:
+            return False, "Could not determine miner's coldkey", ""
+        
+        # Get extrinsics from block
+        extrinsics = payment_block.get("extrinsics", [])
+        if extrinsic_index >= len(extrinsics):
+            return False, f"Extrinsic index {extrinsic_index} out of range", coldkey
+        
+        payment_extrinsic = extrinsics[extrinsic_index]
+        
+        # Verify it's a balance transfer
+        call = payment_extrinsic.value.get("call", {})
+        if call.get("call_module") != "Balances":
+            return False, "Not a Balances call", coldkey
+        
+        call_function = call.get("call_function")
+        if call_function not in ["transfer", "transfer_keep_alive"]:
+            return False, f"Not a transfer call: {call_function}", coldkey
+        
+        # Verify sender is miner's coldkey
+        sender = payment_extrinsic.value.get("address")
+        if sender != coldkey:
+            return False, f"Sender mismatch: expected {coldkey}, got {sender}", coldkey
+        
+        # Extract destination and value from call_args
+        call_args = call.get("call_args", [])
+        dest = None
+        value = None
+        
+        for arg in call_args:
+            if arg.get("name") == "dest":
+                dest = arg.get("value")
+            elif arg.get("name") == "value":
+                value = arg.get("value")
+        
+        # Verify destination matches expected recipient
+        if dest != recipient_address:
+            return False, f"Payment destination mismatch: expected {recipient_address}, got {dest}", coldkey
+        
+        # Verify amount
+        if value is None:
+            return False, "Payment value not found in transaction", coldkey
+        
+        if value < expected_amount_rao:
+            return False, f"Insufficient payment: expected {expected_amount_rao}, got {value}", coldkey
+        
+        logger.info(f"✅ Payment verified: {value:,} RAO from {coldkey} to {dest}")
+        return True, "", coldkey
+        
+    except Exception as e:
+        logger.error(f"Payment verification error: {e}")
+        return False, f"Payment verification error: {e}", ""
 
 
 async def verify_code_timestamp(
@@ -206,6 +299,11 @@ async def create_submission(
     
     SECURITY: This endpoint receives code from miners and stores it privately.
     Miners never get direct access to storage.
+    
+    Payment verification happens UPFRONT (before accepting code):
+    1. Check if payment has already been used (prevents double-spend)
+    2. Verify payment on chain (amount, recipient, sender)
+    3. Record payment to prevent reuse
     """
     logger.info(f"Received submission from miner {request.miner_hotkey} (UID: {request.miner_uid})")
     
@@ -218,6 +316,47 @@ async def create_submission(
         )
     
     logger.info(f"✅ Signature verified - miner authenticated")
+    
+    # === PAYMENT VERIFICATION (done UPFRONT like Ridges) ===
+    miner_coldkey = ""  # Will be set during payment verification
+    
+    if request.payment_block_hash and request.payment_extrinsic_index is not None:
+        # 1. Check if payment was already used (prevents double-spending)
+        existing_payment = await db.get_payment_by_hash(
+            request.payment_block_hash, 
+            request.payment_extrinsic_index
+        )
+        if existing_payment:
+            logger.warning(f"🚫 Payment already used for submission {existing_payment.submission_id}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Payment has already been used for submission {existing_payment.submission_id}"
+            )
+        
+        # 2. Verify payment on chain
+        payment_valid, payment_error, miner_coldkey = await verify_payment_on_chain(
+            block_hash=request.payment_block_hash,
+            extrinsic_index=request.payment_extrinsic_index,
+            miner_hotkey=request.miner_hotkey,
+            expected_amount_rao=request.payment_amount_rao or hparams.submission_cost_rao,
+            recipient_address=config.validator_hotkey,  # Payment goes to validator
+        )
+        
+        if not payment_valid:
+            logger.warning(f"❌ Payment verification failed: {payment_error}")
+            raise HTTPException(
+                status_code=402,  # Payment Required
+                detail=f"Payment verification failed: {payment_error}"
+            )
+        
+        logger.info(f"✅ Payment verified - {request.payment_amount_rao or hparams.submission_cost_rao:,} RAO")
+    else:
+        # Payment not provided - reject submission
+        logger.warning(f"🚫 No payment provided from miner {request.miner_hotkey}")
+        raise HTTPException(
+            status_code=402,  # Payment Required
+            detail="Submission requires payment. Send submission_cost_rao to validator first."
+        )
     
     # ANTI-COPYING: Verify blockchain timestamp (multi-validator protection)
     # TODO: Make this REQUIRED once blockchain posting is fully implemented
@@ -320,9 +459,29 @@ async def create_submission(
             if temp_file.exists():
                 temp_file.unlink()
     
+    # ANTI-COPYING: Check for exact duplicate code (same hash)
+    all_submissions = await db.get_all_submissions()
+    for existing in all_submissions:
+        if existing.code_hash == request.code_hash:
+            logger.warning(f"🚫 Duplicate code detected: hash {request.code_hash[:16]}... already exists")
+            # Store the failed submission so it appears in recent submissions
+            failed_submission = SubmissionModel(
+                submission_id=str(uuid.uuid4()),
+                miner_hotkey=request.miner_hotkey,
+                miner_uid=request.miner_uid,
+                code_hash=request.code_hash,
+                bucket_path="",  # No code stored for duplicates
+                status=SubmissionStatus.FAILED_COPY,
+                error_message=f"Duplicate: same code as {existing.submission_id[:8]}...",
+            )
+            await db.save_submission(failed_submission)
+            raise HTTPException(
+                status_code=409,
+                detail=f"This exact code has already been submitted (submission {existing.submission_id[:8]}...)"
+            )
+    
     # ANTI-COPYING: Check submission cooldown (prevent rapid copying)
-    recent_submissions = await db.get_all_submissions()
-    miner_submissions = [s for s in recent_submissions if s.miner_uid == request.miner_uid]
+    miner_submissions = [s for s in all_submissions if s.miner_uid == request.miner_uid]
     
     if miner_submissions:
         latest = max(miner_submissions, key=lambda s: s.created_at)
@@ -336,6 +495,48 @@ async def create_submission(
                 status_code=429,
                 detail=f"Cooldown period active. Please wait {minutes_remaining} minutes before next submission."
             )
+    
+    # ANTI-COPYING: Check similarity against miner's own previous submissions
+    # This prevents trivial modifications to bypass duplicate detection
+    for sub in miner_submissions:
+        r2 = get_r2_storage()
+        temp_file = Path(tempfile.mktemp(suffix=".py"))
+        try:
+            success = await r2.download_code(sub.bucket_path, str(temp_file))
+            if success and temp_file.exists():
+                existing_code = temp_file.read_text()
+                similarity = calculate_similarity(request.code, existing_code)
+                
+                if similarity.overall_score > 0.9:  # 90% similar to own previous code
+                    logger.warning(
+                        f"🚫 Code too similar to own previous submission: "
+                        f"{similarity.overall_score:.0%} similar to {sub.submission_id[:8]}..."
+                    )
+                    # Store the failed submission so it appears in recent submissions
+                    failed_submission = SubmissionModel(
+                        submission_id=str(uuid.uuid4()),
+                        miner_hotkey=request.miner_hotkey,
+                        miner_uid=request.miner_uid,
+                        code_hash=request.code_hash,
+                        bucket_path="",
+                        status=SubmissionStatus.FAILED_COPY,
+                        error_message=f"Too similar ({similarity.overall_score:.0%}) to {sub.submission_id[:8]}...",
+                    )
+                    await db.save_submission(failed_submission)
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Code is {similarity.overall_score:.0%} similar to your previous submission. "
+                            f"Please make significant changes before resubmitting."
+                        )
+                    )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.debug(f"Could not compare with own submission {sub.submission_id[:8]}...: {e}")
+        finally:
+            if temp_file.exists():
+                temp_file.unlink()
     
     # Basic submission validation
     if len(request.code) < 100:
@@ -383,13 +584,25 @@ async def create_submission(
             bucket_path=bucket_path,
             payment_block_hash=request.payment_block_hash,
             payment_extrinsic_index=request.payment_extrinsic_index,
-            payment_amount_rao=request.payment_amount_rao,
-            payment_verified=False,  # Validator will verify
+            payment_amount_rao=request.payment_amount_rao or hparams.submission_cost_rao,
+            payment_verified=True,  # Payment verified upfront
             code_timestamp_block_hash=request.code_timestamp_block_hash,
             code_timestamp_extrinsic_index=request.code_timestamp_extrinsic_index,
             code_fingerprint=request.code_fingerprint,  # For cross-validator copy detection
         )
         await db.save_submission(submission)
+        
+        # Record payment to prevent double-spending (similar to Ridges)
+        if request.payment_block_hash and request.payment_extrinsic_index is not None:
+            await db.record_payment(
+                block_hash=request.payment_block_hash,
+                extrinsic_index=request.payment_extrinsic_index,
+                submission_id=submission.submission_id,
+                miner_hotkey=request.miner_hotkey,
+                miner_coldkey=miner_coldkey,
+                amount_rao=request.payment_amount_rao or hparams.submission_cost_rao,
+            )
+            logger.info(f"💰 Payment recorded - prevents reuse")
         
         logger.info(f"Submission created: {submission.submission_id}")
         
