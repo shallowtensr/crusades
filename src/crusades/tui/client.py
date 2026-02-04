@@ -2,12 +2,13 @@
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from crusades.config import get_hparams
 from crusades.core.protocols import SubmissionStatus
 
 
@@ -21,6 +22,7 @@ class CrusadesData:
     recent: list[dict[str, Any]]
     queue: dict[str, Any]
     history: list[dict[str, Any]]
+    threshold: dict[str, Any] | None = None  # Adaptive threshold info
 
 
 @dataclass
@@ -89,6 +91,15 @@ class MockClient:
     def get_history(self) -> list[dict[str, Any]]:
         return self._history
 
+    def get_adaptive_threshold(self) -> dict[str, Any]:
+        """Mock adaptive threshold."""
+        return {
+            "current_threshold": 0.20,
+            "last_improvement": 0.20,
+            "last_update_block": 1000,
+            "decayed_threshold": 0.15,  # Decayed from 20% to 15%
+        }
+
     def fetch_all(self) -> CrusadesData:
         return CrusadesData(
             overview=self.get_overview(),
@@ -97,6 +108,7 @@ class MockClient:
             recent=self.get_recent_submissions(),
             queue=self.get_queue_stats(),
             history=self.get_history(),
+            threshold=self.get_adaptive_threshold(),
         )
 
     def get_submission(self, submission_id: str) -> dict[str, Any]:
@@ -119,12 +131,25 @@ class MockClient:
 class DatabaseClient:
     """Client that reads directly from validator's SQLite database."""
 
-    def __init__(self, db_path: str = "crusades.db"):
+    def __init__(self, db_path: str = "crusades.db", spec_version: int | None = None):
         self.db_path = Path(db_path)
+        self.spec_version = spec_version
         if not self.db_path.exists():
             raise FileNotFoundError(f"Database not found: {db_path}")
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+
+    def _version_filter(self, alias: str = "s") -> str:
+        """Get SQL WHERE clause for spec_version filtering.
+
+        Note: spec_version is validated as int in __init__ and derived from
+        hardcoded package version, not user input. Using int() as defense-in-depth.
+        """
+        if self.spec_version is None:
+            return ""
+        # Validate spec_version is an integer to prevent SQL injection
+        version = int(self.spec_version)
+        return f" AND {alias}.spec_version = {version}"
 
     def close(self):
         self._conn.close()
@@ -147,50 +172,167 @@ class DatabaseClient:
         row = cursor.fetchone()
         return dict(row) if row else None
 
+    def get_adaptive_threshold(
+        self,
+        base_threshold: float | None = None,
+        decay_percent: float | None = None,
+        decay_interval_blocks: int | None = None,
+        block_time: int | None = None,
+    ) -> dict[str, Any]:
+        """Get current adaptive threshold info.
+
+        Calculates the decayed threshold based on time elapsed since last update.
+        Uses values from hparams.json if not explicitly provided.
+        """
+        # Get defaults from hparams
+        hparams = get_hparams()
+        threshold_config = hparams.adaptive_threshold
+        base_threshold = base_threshold if base_threshold is not None else threshold_config.base_threshold
+        decay_percent = decay_percent if decay_percent is not None else threshold_config.decay_percent
+        decay_interval_blocks = decay_interval_blocks if decay_interval_blocks is not None else threshold_config.decay_interval_blocks
+        block_time = block_time if block_time is not None else hparams.block_time
+        try:
+            row = self._query_one(
+                "SELECT current_threshold, last_improvement, last_update_block, updated_at "
+                "FROM adaptive_threshold WHERE id = 1"
+            )
+        except sqlite3.OperationalError:
+            # Table doesn't exist yet
+            row = None
+
+        if not row:
+            return {
+                "current_threshold": base_threshold,
+                "last_improvement": 0.0,
+                "last_update_block": 0,
+                "decayed_threshold": base_threshold,
+            }
+
+        # Calculate decay based on time elapsed (estimate blocks from time)
+        current_threshold = row["current_threshold"]
+        updated_at_str = row["updated_at"]
+
+        # Parse updated_at and calculate elapsed time
+        try:
+            updated_at_str = (
+                updated_at_str.replace(" ", "T") if " " in updated_at_str else updated_at_str
+            )
+            # Handle timezone-aware datetimes (e.g., "2026-01-07T10:35:00Z")
+            if updated_at_str.endswith("Z"):
+                updated_at_str = updated_at_str[:-1] + "+00:00"
+            updated_at = datetime.fromisoformat(updated_at_str)
+
+            # Use timezone-aware now() if updated_at is tz-aware, else naive
+            if updated_at.tzinfo is not None:
+                now = datetime.now(UTC)
+            else:
+                now = datetime.now()
+
+            elapsed_seconds = (now - updated_at).total_seconds()
+            # Clamp to non-negative to prevent decay_factor > 1.0 from clock skew
+            elapsed_seconds = max(0, elapsed_seconds)
+            
+            # Guard against misconfigured intervals (avoid division by zero)
+            if block_time <= 0 or decay_interval_blocks <= 0:
+                decayed = current_threshold
+            else:
+                elapsed_blocks = elapsed_seconds / block_time
+                decay_steps = elapsed_blocks / decay_interval_blocks
+                decay_factor = (1.0 - decay_percent) ** decay_steps
+                decayed = base_threshold + (current_threshold - base_threshold) * decay_factor
+        except (ValueError, TypeError):
+            decayed = current_threshold
+
+        return {
+            "current_threshold": current_threshold,
+            "last_improvement": row["last_improvement"],
+            "last_update_block": row["last_update_block"],
+            "decayed_threshold": max(base_threshold, decayed),
+            "updated_at": row["updated_at"],
+        }
+
+    def get_threshold_winner(self, threshold: float = 0.01) -> dict[str, Any] | None:
+        """Get the threshold-adjusted winner (for weight distribution).
+
+        A new submission only beats an incumbent if it's more than `threshold` better.
+        This gives stability to leaders and matches the weight setting logic.
+        """
+        vf = self._version_filter("s")
+        # Get all finished submissions ordered by created_at (oldest first)
+        rows = self._query(
+            f"""SELECT submission_id, final_score, created_at
+               FROM submissions s
+               WHERE status = ? AND final_score IS NOT NULL{vf}
+               ORDER BY created_at ASC""",
+            (SubmissionStatus.FINISHED,),
+        )
+
+        if not rows:
+            return None
+
+        # Build leaderboard with threshold logic (same as database.py get_leaderboard_winner)
+        leaderboard: list[dict] = []
+        for row in rows:
+            score = row["final_score"] or 0.0
+            insert_pos = len(leaderboard)
+
+            for i, existing in enumerate(leaderboard):
+                existing_score = existing["final_score"] or 0.0
+                threshold_score = existing_score * (1 + threshold)
+                if score > threshold_score:
+                    insert_pos = i
+                    break
+
+            leaderboard.insert(insert_pos, dict(row))
+
+        return leaderboard[0] if leaderboard else None
+
     def get_overview(self) -> dict[str, Any]:
-        """Get dashboard overview stats."""
+        """Get dashboard overview stats (filtered by spec_version)."""
         now = datetime.now()
-        # Use space separator to match SQLite datetime format
         day_ago = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        vf = self._version_filter("s")
 
         # Total submissions
-        total = self._query_one("SELECT COUNT(*) as count FROM submissions")
+        total = self._query_one(f"SELECT COUNT(*) as count FROM submissions s WHERE 1=1{vf}")
         total_count = total["count"] if total else 0
 
         # Submissions in last 24h
         recent = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE created_at > ?", (day_ago,)
+            f"SELECT COUNT(*) as count FROM submissions s WHERE created_at > ?{vf}",
+            (day_ago,),
         )
         recent_count = recent["count"] if recent else 0
 
-        # Top score (rank 1 from leaderboard with 1% threshold)
-        # This ensures consistency between "Current Top TPS" and leaderboard rank 1
-        leaderboard = self.get_leaderboard(limit=1)
-        top_score = leaderboard[0]["final_score"] if leaderboard else 0.0
+        # Get adaptive threshold for calculations
+        threshold_data = self.get_adaptive_threshold()
+        adaptive_threshold = threshold_data.get("decayed_threshold", 0.01)
 
-        # Top score from 24 hours ago (best score that existed then)
+        # Top MFU (threshold-adjusted winner - the one who gets weights)
+        threshold_winner = self.get_threshold_winner(threshold=adaptive_threshold)
+        top_score = threshold_winner["final_score"] if threshold_winner else 0.0
+
+        # Top score from 24 hours ago
         top_24h_ago = self._query_one(
-            "SELECT MAX(final_score) as score FROM submissions "
-            "WHERE status = 'finished' AND created_at <= ?",
+            f"SELECT MAX(final_score) as score FROM submissions s "
+            f"WHERE status = 'finished' AND created_at <= ?{vf}",
             (day_ago,),
         )
         score_24h_ago = top_24h_ago["score"] if top_24h_ago and top_24h_ago["score"] else 0.0
 
         # Calculate improvement percentage
         if score_24h_ago > 0:
-            # Have baseline from 24h ago
-            improvement = ((top_score - score_24h_ago) / score_24h_ago) * 100
+            improvement = max(0, ((top_score - score_24h_ago) / score_24h_ago) * 100)
         elif top_score > 0:
-            # No 24h baseline, use earliest score as reference
             first_score = self._query_one(
-                "SELECT final_score FROM submissions WHERE status = 'finished' "
-                "AND final_score > 0 ORDER BY created_at ASC LIMIT 1"
+                f"SELECT final_score FROM submissions s WHERE status = 'finished' "
+                f"AND final_score > 0{vf} ORDER BY created_at ASC LIMIT 1"
             )
             baseline = (
                 first_score["final_score"] if first_score and first_score["final_score"] else 0.0
             )
             if baseline > 0 and baseline != top_score:
-                improvement = ((top_score - baseline) / baseline) * 100
+                improvement = max(0, ((top_score - baseline) / baseline) * 100)
             else:
                 improvement = 0.0
         else:
@@ -198,14 +340,20 @@ class DatabaseClient:
 
         # Active miners (unique hotkeys in last 24h)
         miners = self._query_one(
-            "SELECT COUNT(DISTINCT miner_hotkey) as count FROM submissions WHERE created_at > ?",
+            f"SELECT COUNT(DISTINCT miner_hotkey) as count FROM submissions s "
+            f"WHERE created_at > ?{vf}",
             (day_ago,),
         )
         active_miners = miners["count"] if miners else 0
 
+        # MFU to Beat = threshold winner's score * (1 + threshold)
+        mfu_to_beat = top_score * (1 + adaptive_threshold) if top_score > 0 else 0.0
+
         return {
             "submissions_24h": recent_count,
             "current_top_score": top_score,
+            "mfu_to_beat": round(mfu_to_beat, 4),
+            "adaptive_threshold": adaptive_threshold,
             "score_improvement_24h": round(improvement, 2),
             "total_submissions": total_count,
             "active_miners": active_miners,
@@ -228,21 +376,24 @@ class DatabaseClient:
             return f"{minutes}m"
 
     def get_validator_status(self) -> dict[str, Any]:
-        """Get validator status."""
+        """Get validator status (filtered by spec_version)."""
         now = datetime.now()
-        # Use space separator to match SQLite datetime format
         hour_ago = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        vf = self._version_filter("s")
 
-        # Evaluations in last hour
+        # Evaluations in last hour (join with submissions for version filter)
         evals = self._query_one(
-            "SELECT COUNT(*) as count FROM evaluations WHERE created_at > ?", (hour_ago,)
+            f"SELECT COUNT(*) as count FROM evaluations e "
+            f"JOIN submissions s ON e.submission_id = s.submission_id "
+            f"WHERE e.created_at > ?{vf}",
+            (hour_ago,),
         )
         eval_count = evals["count"] if evals else 0
 
         # Current evaluation (most recent evaluating submission)
         current = self._query_one(
-            "SELECT submission_id FROM submissions WHERE status = 'evaluating' "
-            "ORDER BY created_at DESC LIMIT 1"
+            f"SELECT submission_id FROM submissions s WHERE status = 'evaluating'{vf} "
+            f"ORDER BY created_at DESC LIMIT 1"
         )
 
         # Queue stats
@@ -250,10 +401,10 @@ class DatabaseClient:
 
         # Success rate
         finished = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status = 'finished'"
+            f"SELECT COUNT(*) as count FROM submissions s WHERE status = 'finished'{vf}"
         )
         failed = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status LIKE 'failed%'"
+            f"SELECT COUNT(*) as count FROM submissions s WHERE status LIKE 'failed%'{vf}"
         )
         finished_count = finished["count"] if finished else 0
         failed_count = failed["count"] if failed else 0
@@ -261,12 +412,12 @@ class DatabaseClient:
         success_rate = (finished_count / total * 100) if total > 0 else 0
 
         # Calculate uptime from first submission
-        first_submission = self._query_one("SELECT MIN(created_at) as start_time FROM submissions")
+        first_submission = self._query_one(
+            f"SELECT MIN(created_at) as start_time FROM submissions s WHERE 1=1{vf}"
+        )
         if first_submission and first_submission["start_time"]:
             try:
-                # Parse the timestamp (handles both ISO and SQLite formats)
                 start_str = first_submission["start_time"]
-                # Replace space with T for fromisoformat compatibility
                 start_str = start_str.replace(" ", "T")
                 start_time = datetime.fromisoformat(start_str)
                 uptime_seconds = (now - start_time).total_seconds()
@@ -289,74 +440,78 @@ class DatabaseClient:
         }
 
     def get_leaderboard(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Get leaderboard entries with 1% threshold for position changes.
+        """Get leaderboard with threshold winner at #1, rest sorted by raw MFU.
 
-        A new submission only gets placed ABOVE an existing entry if it beats
-        that entry by more than 1%. This gives incumbents stability - they keep
-        their position unless significantly beaten.
-
-        Submissions are processed in order of creation (oldest first), and each
-        new submission finds its position by comparing against existing entries.
-
-        Ranks are strictly sequential: 1, 2, 3, 4...
+        Position #1: Threshold-adjusted winner (gets emissions)
+        Positions #2+: All others sorted by raw MFU descending
         """
-        # Get all finished submissions ordered by created_at (oldest first)
-        # This ensures earlier submissions have "incumbent advantage"
+        # Get adaptive threshold
+        threshold_data = self.get_adaptive_threshold()
+        threshold = threshold_data.get("decayed_threshold", 0.01)
+
+        # Get threshold winner (position #1)
+        winner = self.get_threshold_winner(threshold=threshold)
+        winner_id = winner["submission_id"] if winner else None
+
+        # Get all submissions sorted by raw score
+        vf = self._version_filter("s")
         rows = self._query(
-            """SELECT s.submission_id, s.miner_hotkey, s.miner_uid, s.final_score,
+            f"""SELECT s.submission_id, s.miner_hotkey, s.miner_uid, s.final_score,
                       s.created_at, COUNT(e.evaluation_id) as eval_count
                FROM submissions s
                LEFT JOIN evaluations e ON s.submission_id = e.submission_id
-               WHERE s.status = ? AND s.final_score IS NOT NULL
+               WHERE s.status = ? AND s.final_score IS NOT NULL{vf}
                GROUP BY s.submission_id
-               ORDER BY s.created_at ASC""",
+               ORDER BY s.final_score DESC""",
             (SubmissionStatus.FINISHED,),
         )
 
-        # 1% threshold - must beat incumbent by more than this to take their spot
-        rank_threshold = 0.01
+        # Build leaderboard: winner first, then others by raw score
+        leaderboard = []
 
-        # Build leaderboard incrementally (oldest submissions first)
-        leaderboard: list[dict[str, Any]] = []
+        # Add winner as #1 (if exists)
+        if winner:
+            # Find winner's full data from rows
+            winner_row = next((r for r in rows if r["submission_id"] == winner_id), None)
+            if winner_row:
+                leaderboard.append({
+                    "rank": 1,
+                    "submission_id": winner_row["submission_id"],
+                    "miner_hotkey": winner_row["miner_hotkey"],
+                    "miner_uid": winner_row["miner_uid"],
+                    "final_score": winner_row["final_score"] or 0.0,
+                    "num_evaluations": winner_row["eval_count"],
+                    "created_at": winner_row["created_at"],
+                })
 
+        # Add remaining submissions (excluding winner) sorted by raw score
+        rank = 2 if winner else 1
         for row in rows:
-            score = row["final_score"] or 0.0
-            entry = {
-                "rank": 0,  # Will be assigned later
-                "submission_id": row["submission_id"],
-                "miner_hotkey": row["miner_hotkey"],
-                "miner_uid": row["miner_uid"],
-                "final_score": score,
-                "num_evaluations": row["eval_count"],
-                "created_at": row["created_at"],
-            }
-
-            # Find insertion position (scan from top)
-            # New entry only goes above existing if it beats them by >1%
-            insert_pos = len(leaderboard)  # Default: add at bottom
-            for i, existing in enumerate(leaderboard):
-                threshold_score = existing["final_score"] * (1 + rank_threshold)
-                if score > threshold_score:
-                    # Beats this incumbent by >1%, insert here
-                    insert_pos = i
+            if row["submission_id"] != winner_id:
+                leaderboard.append({
+                    "rank": rank,
+                    "submission_id": row["submission_id"],
+                    "miner_hotkey": row["miner_hotkey"],
+                    "miner_uid": row["miner_uid"],
+                    "final_score": row["final_score"] or 0.0,
+                    "num_evaluations": row["eval_count"],
+                    "created_at": row["created_at"],
+                })
+                rank += 1
+                if len(leaderboard) >= limit:
                     break
-
-            leaderboard.insert(insert_pos, entry)
-
-        # Assign sequential ranks
-        for i, entry in enumerate(leaderboard):
-            entry["rank"] = i + 1
 
         return leaderboard[:limit]
 
     def get_recent_submissions(self) -> list[dict[str, Any]]:
-        """Get recent submissions (all final statuses)."""
+        """Get recent submissions (filtered by spec_version)."""
+        vf = self._version_filter("s")
         rows = self._query(
-            "SELECT submission_id, miner_hotkey, miner_uid, status, final_score, "
-            "created_at, error_message FROM submissions "
-            "WHERE status IN ('finished', 'failed_validation', 'failed_evaluation', "
-            "'failed_copy', 'error') "
-            "ORDER BY created_at DESC LIMIT 20"
+            f"SELECT submission_id, miner_hotkey, miner_uid, status, final_score, "
+            f"created_at, error_message FROM submissions s "
+            f"WHERE status IN ('finished', 'failed_validation', 'failed_evaluation', "
+            f"'failed_copy', 'error'){vf} "
+            f"ORDER BY created_at DESC LIMIT 20"
         )
 
         recent = []
@@ -375,25 +530,24 @@ class DatabaseClient:
         return recent
 
     def get_queue_stats(self) -> dict[str, Any]:
-        """Get queue statistics."""
-        # Pending + validating = queued
+        """Get queue statistics (filtered by spec_version)."""
+        vf = self._version_filter("s")
+
         queued = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status IN ('pending', 'validating')"
+            f"SELECT COUNT(*) as count FROM submissions s "
+            f"WHERE status IN ('pending', 'validating'){vf}"
         )
 
-        # Running = evaluating
         running = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status = 'evaluating'"
+            f"SELECT COUNT(*) as count FROM submissions s WHERE status = 'evaluating'{vf}"
         )
 
-        # Finished
         finished = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status = 'finished'"
+            f"SELECT COUNT(*) as count FROM submissions s WHERE status = 'finished'{vf}"
         )
 
-        # All failures
         failed = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status IN (?, ?, ?)",
+            f"SELECT COUNT(*) as count FROM submissions s WHERE status IN (?, ?, ?){vf}",
             (
                 SubmissionStatus.FAILED_VALIDATION,
                 SubmissionStatus.FAILED_EVALUATION,
@@ -401,10 +555,9 @@ class DatabaseClient:
             ),
         )
 
-        # Average score
         avg = self._query_one(
-            "SELECT AVG(final_score) as avg FROM submissions "
-            "WHERE status = 'finished' AND final_score IS NOT NULL"
+            f"SELECT AVG(final_score) as avg FROM submissions s "
+            f"WHERE status = 'finished' AND final_score IS NOT NULL{vf}"
         )
 
         return {
@@ -418,35 +571,30 @@ class DatabaseClient:
         }
 
     def get_history(self) -> list[dict[str, Any]]:
-        """Get TPS history for chart - shows rank 1 TPS progression over time.
+        """Get MFU history for chart (filtered by spec_version).
 
-        Uses the same 1% threshold as the leaderboard - the chart only shows
-        TPS going up when a submission beats the incumbent by >1%.
+        Shows running maximum MFU over time (simple max, no threshold).
         """
-        # Get ALL finished submissions ordered by time
+        vf = self._version_filter("s")
         rows = self._query(
-            "SELECT submission_id, final_score as tps, created_at "
-            "FROM submissions "
-            "WHERE status = 'finished' AND final_score IS NOT NULL "
-            "ORDER BY created_at ASC"
+            f"SELECT submission_id, final_score as mfu, created_at "
+            f"FROM submissions s "
+            f"WHERE status = 'finished' AND final_score IS NOT NULL{vf} "
+            f"ORDER BY created_at ASC"
         )
 
         history = []
         running_best = 0.0
-        rank_threshold = 0.01  # 1% threshold, same as leaderboard
 
         for row in rows:
-            tps = row["tps"] or 0.0
-            # Only update running_best if it beats incumbent by >1%
-            # This matches the leaderboard 1% threshold logic
-            threshold_score = running_best * (1 + rank_threshold)
-            if tps > threshold_score:
-                running_best = tps
+            mfu = row["mfu"] or 0.0
+            if mfu > running_best:
+                running_best = mfu
 
             history.append(
                 {
                     "submission_id": row["submission_id"],
-                    "tps": running_best,  # Show rank 1 TPS so far (with threshold)
+                    "mfu": running_best,
                     "timestamp": row["created_at"],
                 }
             )
@@ -461,6 +609,7 @@ class DatabaseClient:
             recent=self.get_recent_submissions(),
             queue=self.get_queue_stats(),
             history=self.get_history(),
+            threshold=self.get_adaptive_threshold(),
         )
 
     def get_submission(self, submission_id: str) -> dict[str, Any]:
@@ -583,10 +732,22 @@ class CrusadesClient:
         return data
 
     def get_history(self) -> list[dict[str, Any]]:
-        """Get TPS history."""
+        """Get MFU history."""
         data = self._get("/api/stats/history")
         if not data or not isinstance(data, list):
             return []
+        return data
+
+    def get_adaptive_threshold(self) -> dict[str, Any]:
+        """Get current adaptive threshold."""
+        data = self._get("/api/stats/threshold")
+        if not data:
+            return {
+                "current_threshold": 0.01,
+                "last_improvement": 0.0,
+                "last_update_block": 0,
+                "decayed_threshold": 0.01,
+            }
         return data
 
     def fetch_all(self) -> CrusadesData:
@@ -598,6 +759,7 @@ class CrusadesClient:
             recent=self.get_recent_submissions(),
             queue=self.get_queue_stats(),
             history=self.get_history(),
+            threshold=self.get_adaptive_threshold(),
         )
 
     def get_submission(self, submission_id: str) -> dict[str, Any]:
