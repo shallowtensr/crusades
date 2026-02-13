@@ -15,6 +15,13 @@ COPY --chown=appuser:appuser environments/templar/requirements.txt /app/
 USER appuser
 RUN pip install --no-cache-dir --user -r requirements.txt
 
+# Remove g++/make but keep gcc for torch.compile inductor backend
+USER root
+RUN apt-get purge -y g++ make dpkg-dev && apt-get autoremove -y \
+    && apt-get update && apt-get install -y --no-install-recommends gcc \
+    && rm -rf /var/lib/apt/lists/*
+USER appuser
+
 # Copy hparams and download model/dataset based on config
 COPY --chown=appuser:appuser hparams/hparams.json /app/
 

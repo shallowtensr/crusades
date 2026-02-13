@@ -42,6 +42,7 @@
 # Clone and setup
 git clone https://github.com/one-covenant/crusades
 cd crusades
+curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 
 # Create .env (for HuggingFace access)
@@ -163,10 +164,13 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 - Access optimizer internals (e.g., `optimizer.optimizer`, `optimizer._opt_impl`)
 - Truncate or skip parts of input sequences
 - Return `None` for `final_logits`
-- Import forbidden modules: `gc`, `ctypes`, `subprocess`, `importlib`
+- Import forbidden modules: `gc`, `ctypes`, `subprocess`, `importlib`, `os`, `sys`, `inspect`, `pickle`, `signal`, `threading`, `multiprocessing`, `socket`, `http`, `io`, `ast`, etc.
 - Modify torch backend settings (`cudnn.deterministic`, `cudnn.benchmark`, SDP toggles, `set_float32_matmul_precision`)
 - Freeze layers or modify `requires_grad` settings
 - Report inflated token counts
+- Alias the `torch` module (e.g., `import torch as t`) — the security scanner only recognizes the literal name `torch` for allowlisted calls like `torch.compile`
+
+> **Note:** The validator skips the `if __name__ == "__main__":` block entirely. Modules like `pathlib` that are forbidden at the top level can still be imported inside `__main__` for local testing.
 
 ---
 
@@ -180,7 +184,7 @@ Key settings in `hparams/hparams.json`:
 | `evaluation_runs` | 5 | Runs per submission (median taken) |
 | `eval_steps` | 5 | Training steps per evaluation |
 | `benchmark_model_name` | Qwen/Qwen2.5-3B | Model for evaluation |
-| `benchmark_batch_size` | 4 | Batch size for evaluation |
+| `benchmark_batch_size` | 8 | Batch size for evaluation |
 
 ---
 

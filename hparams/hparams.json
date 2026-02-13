@@ -14,7 +14,7 @@
     "benchmark_data_samples": 10000,
     "benchmark_master_seed": 42,
     "benchmark_sequence_length": 1024,
-    "benchmark_batch_size": 4,
+    "benchmark_batch_size": 8,
 
     "set_weights_interval_blocks": 100,
     "reveal_blocks": 100,
@@ -41,7 +41,7 @@
         "max_loss_difference": 0.3,
         "min_params_changed_ratio": 0.8,
         "gradient_norm_ratio_max": 1.06,
-        "weight_relative_error_max": 0.009
+        "weight_relative_error_max": 0.008
     },
 
     "mfu": {
