@@ -31,6 +31,11 @@ from crusades.chain.commitments import (
     CommitmentReader,
     MinerCommitment,
 )
+from crusades.chain.payment import (
+    get_hotkey_owner,
+    resolve_payment_address,
+    verify_payment_on_chain_async,
+)
 from crusades.chain.weights import WeightSetter
 from crusades.config import get_config, get_hparams
 from crusades.core.protocols import SubmissionStatus
@@ -278,6 +283,138 @@ class Validator(BaseNode):
         except Exception as e:
             logger.exception(f"Error processing commitments: {e}")
 
+    async def _verify_submission_payment(
+        self,
+        commitment: MinerCommitment,
+        submission_id: str,
+    ) -> bool:
+        """Verify that the miner has paid the submission fee via alpha transfer.
+
+        Scans recent blocks for a SubtensorModule.transfer_stake extrinsic from
+        the miner's coldkey to the burn_uid owner's coldkey, and records the
+        payment in the database to prevent double-spend.
+
+        Returns:
+            True if payment verified (or payments disabled), False otherwise
+        """
+        hparams = get_hparams()
+
+        if not hparams.payment.enabled:
+            logger.debug("Payment verification disabled in hparams")
+            return True
+
+        if self.chain is None:
+            logger.error("No chain connection — cannot verify payment")
+            return False
+
+        scan_blocks = hparams.payment.scan_blocks
+        netuid = hparams.netuid
+
+        # Derive payment destination: burn_uid → hotkey → coldkey owner
+        payment_address = resolve_payment_address(self.chain.subtensor, netuid, hparams.burn_uid)
+        if payment_address is None:
+            logger.error("Could not resolve payment address from burn_uid — cannot verify payment")
+            return False
+
+        # Look up miner's coldkey from their hotkey
+        miner_coldkey = get_hotkey_owner(
+            self.chain.subtensor, commitment.hotkey, block=commitment.reveal_block
+        )
+        if miner_coldkey is None:
+            logger.error(
+                f"Could not look up coldkey for hotkey {commitment.hotkey[:16]}... "
+                f"- cannot verify payment"
+            )
+            return False
+
+        logger.info(
+            f"Verifying payment for {commitment.hotkey[:16]}... "
+            f"(coldkey: {miner_coldkey[:16]}..., dest: {payment_address[:16]}...)"
+        )
+
+        # Convert fee_rao (TAO) to expected alpha using the subnet AMM rate.
+        min_alpha = 0
+        try:
+            subnet_info = self.chain.subtensor.subnet(netuid=netuid)
+            expected_alpha, _ = subnet_info.tao_to_alpha_with_slippage(
+                bt.Balance.from_rao(hparams.payment.fee_rao)
+            )
+            min_alpha = int(expected_alpha.rao * 0.90)
+            logger.debug(
+                f"Payment min_alpha: {min_alpha} "
+                f"(fee_rao={hparams.payment.fee_rao}, expected_alpha={expected_alpha.rao})"
+            )
+        except Exception as e:
+            logger.warning(f"Could not query AMM rate, skipping amount check: {e}")
+
+        payment = await verify_payment_on_chain_async(
+            subtensor=self.chain.subtensor,
+            miner_coldkey=miner_coldkey,
+            commitment_block=commitment.reveal_block,
+            payment_address=payment_address,
+            netuid=netuid,
+            scan_blocks=scan_blocks,
+            min_amount=min_alpha,
+        )
+
+        if payment is None:
+            logger.warning(
+                f"No valid payment found for {commitment.hotkey[:16]}... "
+                f"(required transfer_stake to {payment_address[:16]}... on netuid {netuid})"
+            )
+            return False
+
+        # Check for double-spend, but allow idempotent retries.
+        already_used = await self.db.is_payment_used(payment.block_hash, payment.extrinsic_index)
+        if already_used:
+            existing_payment = await self.db.get_payment_for_submission(submission_id)
+            if (
+                existing_payment
+                and existing_payment.block_hash == payment.block_hash
+                and existing_payment.extrinsic_index == payment.extrinsic_index
+            ):
+                logger.info(
+                    f"Payment for {submission_id} already recorded (idempotent retry) — reusing"
+                )
+                return True
+            logger.warning(
+                f"Payment at block {payment.block_hash[:16]}... extrinsic {payment.extrinsic_index} "
+                f"already used for another submission"
+            )
+            return False
+
+        # Record the payment (unique constraint guards against concurrent claims)
+        try:
+            await self.db.record_verified_payment(
+                submission_id=submission_id,
+                miner_hotkey=commitment.hotkey,
+                miner_coldkey=miner_coldkey,
+                block_hash=payment.block_hash,
+                extrinsic_index=payment.extrinsic_index,
+                amount_rao=payment.alpha_amount,
+            )
+        except ValueError:
+            # Concurrent insert won the race — check if it was for this same submission
+            existing_payment = await self.db.get_payment_for_submission(submission_id)
+            if (
+                existing_payment
+                and existing_payment.block_hash == payment.block_hash
+                and existing_payment.extrinsic_index == payment.extrinsic_index
+            ):
+                logger.info(f"Payment for {submission_id} recorded by concurrent task — reusing")
+                return True
+            logger.warning(
+                f"Payment at block {payment.block_hash[:16]}... extrinsic {payment.extrinsic_index} "
+                f"was concurrently claimed by another submission"
+            )
+            return False
+
+        logger.info(
+            f"Payment verified: {payment.alpha_amount} alpha at block "
+            f"{payment.block_hash[:16]}... extrinsic {payment.extrinsic_index}"
+        )
+        return True
+
     async def _create_submission_from_commitment(
         self,
         commitment: MinerCommitment,
@@ -325,12 +462,35 @@ class Validator(BaseNode):
                 )
                 return
 
+        # Verify payment before creating the submission
+        payment_verified = await self._verify_submission_payment(commitment, submission_id)
+
+        if not payment_verified:
+            # Create submission but mark it as failed
+            failed_submission = SubmissionModel(
+                submission_id=submission_id,
+                miner_hotkey=commitment.hotkey,
+                miner_uid=commitment.uid,
+                code_hash=commitment.code_url_info.code_hash or "",
+                bucket_path=commitment.code_url_info.url,
+                status=SubmissionStatus.FAILED_EVALUATION,
+                payment_verified=False,
+                spec_version=crusades.COMPETITION_VERSION,
+                error_message="Payment not verified: no valid transfer_stake payment found on-chain",
+            )
+            try:
+                await self.db.save_submission(failed_submission)
+                logger.warning(f"Submission {submission_id} FAILED: payment not verified")
+            except Exception:
+                logger.exception(f"Failed to save failed submission {submission_id}")
+            return
+
         submission = SubmissionModel(
             submission_id=submission_id,
             miner_hotkey=commitment.hotkey,
             miner_uid=commitment.uid,
-            code_hash=commitment.code_url_info.code_hash or "",  # 128-bit truncated SHA256
-            bucket_path=commitment.code_url_info.url,  # Store code URL
+            code_hash=commitment.code_url_info.code_hash or "",
+            bucket_path=commitment.code_url_info.url,
             status=SubmissionStatus.EVALUATING,
             payment_verified=True,
             spec_version=crusades.COMPETITION_VERSION,
@@ -342,6 +502,7 @@ class Validator(BaseNode):
             logger.info(f"   Code URL: {commitment.code_url_info.url[:60]}...")
             logger.info(f"   UID: {commitment.uid}")
             logger.info(f"   Hotkey: {commitment.hotkey[:16]}...")
+            logger.info("   Payment: verified")
         except Exception as e:
             logger.error(f"Failed to save submission: {e}")
             logger.exception("Traceback:")

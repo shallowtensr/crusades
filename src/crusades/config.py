@@ -5,7 +5,7 @@ from functools import cache
 from pathlib import Path
 from typing import Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -54,6 +54,21 @@ class AdaptiveThresholdConfig(BaseModel):
     base_threshold: float = 0.01  # Minimum threshold (1%)
     decay_percent: float = 0.05  # Percent to lose per interval (5% = loses 5% of excess)
     decay_interval_blocks: int = 100  # Blocks between decay steps (~20 min)
+
+
+class PaymentConfig(BaseModel):
+    """Submission payment settings.
+
+    Miners stake TAO as alpha then transfer_stake it to the coldkey that
+    owns burn_uid's hotkey. The destination is derived from the metagraph
+    at runtime. The validator scans for a SubtensorModule.transfer_stake
+    extrinsic on-chain before evaluating. Unlike plain add_stake, a
+    transfer_stake moves ownership to a different coldkey — irreversible.
+    """
+
+    enabled: bool = True
+    fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
+    scan_blocks: int = 200  # How many blocks around commitment to scan for payment
 
 
 class DockerConfig(BaseModel):
@@ -154,8 +169,27 @@ class HParams(BaseModel):
     # Adaptive threshold for leaderboard
     adaptive_threshold: AdaptiveThresholdConfig = Field(default_factory=AdaptiveThresholdConfig)
 
+    # Submission payment (alpha staking fee)
+    payment: PaymentConfig = Field(default_factory=PaymentConfig)
+
     # Storage (for evaluation records - not in hparams.json)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+
+    @model_validator(mode="after")
+    def _validate_scan_window(self) -> Self:
+        """Ensure payment.scan_blocks >= reveal_blocks.
+
+        The miner transfers ~reveal_blocks before the reveal. If scan_blocks
+        is smaller, the payment will always fall outside the scan window
+        and every verification will silently fail.
+        """
+        if self.payment.enabled and self.payment.scan_blocks < self.reveal_blocks:
+            raise ValueError(
+                f"payment.scan_blocks ({self.payment.scan_blocks}) must be >= "
+                f"reveal_blocks ({self.reveal_blocks}). Otherwise the validator "
+                f"will never find the miner's payment on-chain."
+            )
+        return self
 
     @classmethod
     def load(cls, path: Path | str | None = None) -> Self:

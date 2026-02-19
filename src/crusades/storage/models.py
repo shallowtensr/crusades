@@ -4,6 +4,7 @@ import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Enum,
@@ -79,7 +80,7 @@ class SubmissionModel(Base):
     code_content: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Rate limiting handled by checking commit_block in submission_id
-    payment_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    payment_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Relationships
     evaluations: Mapped[list["EvaluationModel"]] = relationship(
@@ -134,6 +135,36 @@ class AdaptiveThresholdModel(Base):
         nullable=False,
         default=lambda: datetime.now(UTC),
         onupdate=lambda: datetime.now(UTC),
+    )
+
+
+class VerifiedPaymentModel(Base):
+    """Database model for tracking verified submission payments.
+
+    Records transfer_stake transactions from miners that serve as submission fees.
+    Used to prevent double-spend (same payment claimed for multiple submissions).
+
+    Each record links a unique on-chain transfer_stake extrinsic to a submission.
+    """
+
+    __tablename__ = "verified_payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    submission_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    miner_hotkey: Mapped[str] = mapped_column(String(48), nullable=False)
+    miner_coldkey: Mapped[str] = mapped_column(String(48), nullable=False)
+    block_hash: Mapped[str] = mapped_column(String(66), nullable=False)
+    extrinsic_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_rao: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=lambda: datetime.now(UTC)
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_verified_payments_block_extrinsic", "block_hash", "extrinsic_index", unique=True
+        ),
+        Index("idx_verified_payments_miner", "miner_hotkey"),
     )
 
 

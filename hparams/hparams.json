@@ -40,9 +40,9 @@
     "verification": {
         "max_loss_difference": 0.3,
         "min_params_changed_ratio": 0.8,
-        "gradient_norm_ratio_max": 1.06,
+        "gradient_norm_ratio_max": 1.08,
         "weight_relative_error_max": 0.006,
-        "timer_divergence_threshold": 0.01
+        "timer_divergence_threshold": 0.005
     },
 
     "mfu": {
@@ -52,8 +52,14 @@
     },
 
     "adaptive_threshold": {
-        "base_threshold": 0.05,
+        "base_threshold": 0.02,
         "decay_percent": 0.05,
         "decay_interval_blocks": 100
+    },
+
+    "payment": {
+        "enabled": true,
+        "fee_rao": 100000000,
+        "scan_blocks": 200
     }
 }
