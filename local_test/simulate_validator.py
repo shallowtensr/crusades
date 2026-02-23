@@ -35,7 +35,12 @@ async def simulate():
     hparams_path = Path("/app/hparams.json") 
     if not hparams_path.exists():
         hparams_path = Path("/app/hparams/hparams.json")
-        
+    
+    if not hparams_path.exists():
+        print(f"ERROR: hparams.json not found at /app/hparams.json or /app/hparams/hparams.json")
+        print("Launch it with the command at the top of this file")
+        sys.exit(1)
+
     print(f"Loading hparams from: {hparams_path}")
     with open(hparams_path) as f:
         hb = json.load(f)
@@ -43,13 +48,18 @@ async def simulate():
     # 2. Load your WIP code
     # We will mount this to /test/train.py
     code_path = Path("/test/train.py")
+    if not code_path.exists() or not code_path.is_file():
+        print(f"ERROR: train.py not found at {code_path}")
+        print("Launch it with the command at the top of this file")
+        sys.exit(1)
+
     print(f"Loading miner code from: {code_path}")
     code = code_path.read_text()
     
     # 3. Setup Actor
     actor = Actor()
     
-    # 4. Run Evaluation (Exact same signature as the validator)
+    # 4. Run Evaluation (mirrors the validator's thresholds from hparams)
     result = await actor.evaluate(
         task_id=1337,
         seed="local:test:1",
@@ -67,6 +77,9 @@ async def simulate():
         # MFU settings
         gpu_peak_tflops=hb["mfu"]["gpu_peak_tflops"],
         min_mfu=hb["mfu"]["min_mfu"],
+        max_plausible_mfu=hb["mfu"]["max_plausible_mfu"],
+        # Timer integrity check
+        timer_divergence_threshold=hb["verification"]["timer_divergence_threshold"],
     )
     
     # 5. Output Result
@@ -82,8 +95,21 @@ async def simulate():
     print(f"TPS: {result.get('tps', 0.0):.2f}")
     
     print("\nDiagnostics:")
-    # Clean up large tensors from diagnostics for display
-    diag = result.get('diagnostics', {})
+    # Clean up non-serializable objects from diagnostics (tensors, etc.)
+    def sanitize(obj):
+        if isinstance(obj, dict):
+            return {k: sanitize(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [sanitize(x) for x in obj]
+        elif hasattr(obj, 'tolist'): # numpy and torch tensors
+            return obj.tolist()
+        elif hasattr(obj, 'detach'): # torch tensors (if tolist not present)
+            return obj.cpu().detach().tolist()
+        elif not isinstance(obj, (str, int, float, bool, type(None))):
+            return str(obj)
+        return obj
+
+    diag = sanitize(result.get('diagnostics', {}))
     print(json.dumps(diag, indent=2))
     print("="*50)
 
