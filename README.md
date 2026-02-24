@@ -80,9 +80,9 @@ docker build --network=host -f environments/templar/Dockerfile \
 # when executed on the same GPU model (A100). Runs on other hardware may
 # produce divergent MFU results.
 docker run --gpus all -it --rm \
-    -v $(pwd)/local_test/train.py:/test/train.py \
-    -v $(pwd)/local_test/simulate_validator.py:/test/simulate.py \
-    -v $(pwd)/hparams/hparams.json:/app/hparams.json \
+    -v "$(pwd)/local_test/train.py":/test/train.py \
+    -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py \
+    -v "$(pwd)/hparams/hparams.json":/app/hparams.json \
     -e PYTHONPATH=/app \
     templar-eval:latest \
     python3 /test/simulate.py
