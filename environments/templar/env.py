@@ -802,6 +802,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
 
 
 _FORBIDDEN_STRINGS = FORBIDDEN_STRINGS
+_MAX_BYTES_LITERAL_ELTS = 4096
 
 
 def _is_main_guard(node: ast.AST) -> bool:
@@ -871,6 +872,8 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
             ):
                 try:
                     if inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List):
+                        if len(inner.args[0].elts) > _MAX_BYTES_LITERAL_ELTS:
+                            raise ValueError("bytes literal too large")
                         int_values = []
                         for elt in inner.args[0].elts:
                             if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
@@ -926,6 +929,8 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                         inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List)
                     ):
                         raise ValueError("not a simple bytes([int, ...]) pattern")
+                    if len(inner.args[0].elts) > _MAX_BYTES_LITERAL_ELTS:
+                        raise ValueError("bytes literal too large")
 
                     int_values = []
                     for elt in inner.args[0].elts:

@@ -70,6 +70,7 @@ _FORBIDDEN_TORCH_SYMBOL_IMPORTS = FORBIDDEN_TORCH_SYMBOL_IMPORTS
 _FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS = FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS
 _FORBIDDEN_TORCH_ATTRIBUTE_ALIASES = FORBIDDEN_TORCH_ATTRIBUTE_ALIASES
 _BLOCKED_BUILTINS = FORBIDDEN_BUILTINS
+_MAX_BYTES_LITERAL_ELTS = 4096
 
 
 def _is_main_guard(node: ast.AST) -> bool:
@@ -556,6 +557,8 @@ def validate_code_structure(code: str) -> list[str]:
             ):
                 try:
                     if inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List):
+                        if len(inner.args[0].elts) > _MAX_BYTES_LITERAL_ELTS:
+                            raise ValueError("bytes literal too large")
                         int_values = []
                         for elt in inner.args[0].elts:
                             if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
@@ -608,6 +611,8 @@ def validate_code_structure(code: str) -> list[str]:
                         inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List)
                     ):
                         raise ValueError("not simple")
+                    if len(inner.args[0].elts) > _MAX_BYTES_LITERAL_ELTS:
+                        raise ValueError("bytes literal too large")
 
                     int_values = []
                     for elt in inner.args[0].elts:
